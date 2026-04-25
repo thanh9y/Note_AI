@@ -1,102 +1,93 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useState } from "react";
 import { View, Text, TextInput, Pressable, FlatList, Alert } from "react-native";
-import { router } from "expo-router";
+import { router, useFocusEffect } from "expo-router";
 
 import { colors, radius, space } from "../theme/tokens";
 import { useAuth } from "../auth/AuthContext";
-import { listenNotes, updateNote } from "../firestore/notesApi.js";
+import { listenFolders, addFolder, updateFolder, removeFolder } from "../firestore/foldersApi";
 
 export default function FoldersScreen() {
   const { user, loading } = useAuth();
 
-  const [notes, setNotes] = useState([]);
-
-  // UI states
+  const [folders, setFolders] = useState([]);
   const [newFolder, setNewFolder] = useState("");
-  const [renameFrom, setRenameFrom] = useState(null);
-  const [renameTo, setRenameTo] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editingName, setEditingName] = useState("");
 
-  useEffect(() => {
-    if (loading) return;
-    if (!user) {
-      router.replace("/login");
-      return;
-    }
+  useFocusEffect(
+    React.useCallback(() => {
+      if (loading) return;
+      if (!user) {
+        router.replace("/login");
+        return;
+      }
 
-    const unsub = listenNotes(user.uid, (data) => setNotes(data));
-    return unsub;
-  }, [user, loading]);
-
-  const folders = useMemo(() => {
-    const set = new Set();
-    notes.forEach((n) => n.folder && set.add(n.folder));
-    return Array.from(set).sort();
-  }, [notes]);
+      const unsub = listenFolders(user.uid, (data) => setFolders(data));
+      return unsub;
+    }, [user, loading])
+  );
 
   const createFolder = async () => {
     const name = newFolder.trim();
-    if (!name) return;
+    if (!name) return Alert.alert("Lỗi", "Tên folder không được để trống.");
 
-    // Folder chỉ là "nhãn" của note, không có collection riêng.
-    // Để folder xuất hiện ngay, bạn chỉ cần tạo note với folder đó.
-    Alert.alert("Tạo folder", `Đã tạo folder "${name}". Hãy tạo note và chọn folder này.`);
-    setNewFolder("");
-  };
-
-  const startRename = (oldName) => {
-    setRenameFrom(oldName);
-    setRenameTo(oldName);
-  };
-
-  const cancelRename = () => {
-    setRenameFrom(null);
-    setRenameTo("");
-  };
-
-  const confirmRename = async () => {
-    if (!user) return;
-    const from = renameFrom;
-    const to = renameTo.trim();
-
-    if (!from) return;
-    if (!to) return Alert.alert("Lỗi", "Tên folder mới không được rỗng.");
-    if (to === from) return cancelRename();
-
-    // Đổi tên folder = update tất cả note có folder = from
-    const list = notes.filter((n) => n.folder === from);
-    if (list.length === 0) return cancelRename();
+    const exists = folders.some((f) => f.name.toLowerCase() === name.toLowerCase());
+    if (exists) return Alert.alert("Lỗi", "Folder này đã tồn tại.");
 
     try {
-      const now = Date.now();
-      await Promise.all(list.map((n) => updateNote(user.uid, n.id, { folder: to, updatedAt: now })));
-      cancelRename();
-      Alert.alert("Thành công", `Đã đổi "${from}" → "${to}"`);
+      await addFolder(user.uid, name);
+      setNewFolder("");
+      Alert.alert("Thành công", `Đã tạo folder "${name}"`);
     } catch (e) {
-      Alert.alert("Lỗi", e.message);
+      console.log("addFolder error:", e);
+      Alert.alert("Lỗi", "Không thể tạo folder.");
     }
   };
 
-  const deleteFolder = (name) => {
-    if (!user) return;
+  const startRename = (folder) => {
+    setEditingId(folder.id);
+    setEditingName(folder.name);
+  };
 
-    const list = notes.filter((n) => n.folder === name);
+  const cancelRename = () => {
+    setEditingId(null);
+    setEditingName("");
+  };
+
+  const confirmRename = async () => {
+    const name = editingName.trim();
+    if (!name) return Alert.alert("Lỗi", "Tên folder mới không được để trống.");
+
+    const exists = folders.some(
+      (f) => f.id !== editingId && f.name.toLowerCase() === name.toLowerCase()
+    );
+    if (exists) return Alert.alert("Lỗi", "Tên folder đã tồn tại.");
+
+    try {
+      await updateFolder(user.uid, editingId, name);
+      cancelRename();
+      Alert.alert("Thành công", "Đã đổi tên folder.");
+    } catch (e) {
+      console.log("updateFolder error:", e);
+      Alert.alert("Lỗi", "Không thể đổi tên folder.");
+    }
+  };
+
+  const deleteFolder = (folder) => {
     Alert.alert(
-      "Xoá folder?",
-      `Xoá folder "${name}"?\nGhi chú sẽ bị bỏ folder (không xoá ghi chú).`,
+      "Xóa folder?",
+      `Bạn có chắc muốn xóa folder "${folder.name}"?`,
       [
         { text: "Huỷ", style: "cancel" },
         {
-          text: "Xoá",
+          text: "Xóa",
           style: "destructive",
           onPress: async () => {
             try {
-              const now = Date.now();
-              await Promise.all(
-                list.map((n) => updateNote(user.uid, n.id, { folder: "", updatedAt: now }))
-              );
-              Alert.alert("Đã xoá folder", `"${name}" đã được xoá.`);
+              await removeFolder(user.uid, folder.id);
             } catch (e) {
-              Alert.alert("Lỗi", e.message);
+              console.log("removeFolder error:", e);
+              Alert.alert("Lỗi", "Không thể xóa folder.");
             }
           },
         },
@@ -128,9 +119,10 @@ export default function FoldersScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.bg, padding: space.md, gap: 12 }}>
-      {/* Top bar */}
       <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-        <Text style={{ fontSize: 22, fontWeight: "900", color: colors.text }}>Folder Manager</Text>
+        <Text style={{ fontSize: 22, fontWeight: "900", color: colors.text }}>
+          Folder Manager
+        </Text>
 
         <Pressable
           onPress={() => router.back()}
@@ -147,9 +139,11 @@ export default function FoldersScreen() {
         </Pressable>
       </View>
 
-      {/* Create folder */}
       <Card>
-        <Text style={{ fontWeight: "900", marginBottom: 8, color: colors.text }}>Tạo folder</Text>
+        <Text style={{ fontWeight: "900", marginBottom: 8, color: colors.text }}>
+          Tạo folder
+        </Text>
+
         <View style={{ flexDirection: "row", gap: 10 }}>
           <TextInput
             value={newFolder}
@@ -177,23 +171,15 @@ export default function FoldersScreen() {
             <Text style={{ color: "white", fontWeight: "900" }}>Tạo</Text>
           </Pressable>
         </View>
-
-        <Text style={{ marginTop: 8, color: colors.subtext, fontSize: 12 }}>
-          * Folder được lưu như “tên folder” trong mỗi note. Khi bạn gán folder cho note thì folder sẽ
-          xuất hiện trong danh sách.
-        </Text>
       </Card>
 
-      {/* Rename panel */}
-      {renameFrom && (
+      {editingId && (
         <Card>
-          <Text style={{ fontWeight: "900", color: colors.text }}>
-            Đổi tên folder: <Text style={{ color: colors.primary }}>{renameFrom}</Text>
-          </Text>
+          <Text style={{ fontWeight: "900", color: colors.text }}>Đổi tên folder</Text>
 
           <TextInput
-            value={renameTo}
-            onChangeText={setRenameTo}
+            value={editingName}
+            onChangeText={setEditingName}
             placeholder="Nhập tên mới..."
             style={{
               marginTop: 10,
@@ -238,42 +224,34 @@ export default function FoldersScreen() {
         </Card>
       )}
 
-      {/* Folder list */}
       <Text style={{ fontWeight: "900", color: colors.text }}>Danh sách folder</Text>
 
       <FlatList
         data={folders}
-        keyExtractor={(x) => x}
+        keyExtractor={(x) => x.id}
         contentContainerStyle={{ gap: 10, paddingBottom: 30 }}
-        renderItem={({ item }) => {
-          const count = notes.filter((n) => n.folder === item).length;
-
-          return (
-            <Card>
-              <View style={{ flexDirection: "row", justifyContent: "space-between", gap: 10 }}>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ fontWeight: "900", color: colors.text, fontSize: 16 }}>
-                    📁 {item}
-                  </Text>
-                  <Text style={{ color: colors.subtext, marginTop: 4 }}>{count} ghi chú</Text>
-                </View>
-
-                <View style={{ flexDirection: "row", gap: 10 }}>
-                  <Pressable onPress={() => startRename(item)}>
-                    <Text style={{ fontWeight: "900", color: colors.text }}>Rename</Text>
-                  </Pressable>
-                  <Pressable onPress={() => deleteFolder(item)}>
-                    <Text style={{ fontWeight: "900", color: colors.danger }}>Delete</Text>
-                  </Pressable>
-                </View>
+        renderItem={({ item }) => (
+          <Card>
+            <View style={{ flexDirection: "row", justifyContent: "space-between", gap: 10 }}>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontWeight: "900", color: colors.text, fontSize: 16 }}>
+                  📁 {item.name}
+                </Text>
               </View>
-            </Card>
-          );
-        }}
+
+              <View style={{ flexDirection: "row", gap: 10 }}>
+                <Pressable onPress={() => startRename(item)}>
+                  <Text style={{ fontWeight: "900", color: colors.text }}>Rename</Text>
+                </Pressable>
+                <Pressable onPress={() => deleteFolder(item)}>
+                  <Text style={{ fontWeight: "900", color: colors.danger }}>Delete</Text>
+                </Pressable>
+              </View>
+            </View>
+          </Card>
+        )}
         ListEmptyComponent={
-          <Text style={{ color: colors.subtext }}>
-            Chưa có folder nào. Hãy tạo note và nhập Folder để folder xuất hiện.
-          </Text>
+          <Text style={{ color: colors.subtext }}>Chưa có folder nào.</Text>
         }
       />
     </View>

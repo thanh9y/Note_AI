@@ -16,13 +16,15 @@ import DateTimePicker from "@react-native-community/datetimepicker";
 
 import * as ImagePicker from "expo-image-picker";
 import { Audio } from "expo-av";
+import * as FileSystem from "expo-file-system/legacy";
 
 import { useAuth } from "../auth/AuthContext";
 import { addNote, updateNote } from "../firestore/notesApi.js";
+import { listenFolders, addFolder } from "../firestore/foldersApi.js";
 import { scheduleReminder, cancelReminder } from "../notifications/reminders.js";
-import { uploadUriAsync, getUrlFromPath } from "../firebase/storage.js";
-
+import { getUrlFromPath } from "../firebase/storage.js";
 import { colors, radius, space, typography } from "../theme/tokens";
+import { exportNoteToPdf, exportNoteToDocx } from "../utils/exportNote";
 
 function formatDateTime(ms) {
   if (!ms) return "Chưa chọn";
@@ -63,28 +65,30 @@ export default function EditNoteScreen() {
     }
   }, [params]);
 
-  // ====== Basic fields ======
   const [title, setTitle] = useState(note?.title ?? "");
   const [content, setContent] = useState(note?.content ?? "");
   const [folder, setFolder] = useState(note?.folder ?? "");
   const [tagsText, setTagsText] = useState((note?.tags ?? []).join(", "));
   const [color, setColor] = useState(note?.color ?? "gray");
 
-  // ====== Reminder ======
+  const [allFolders, setAllFolders] = useState([]);
+  const [showFolderPicker, setShowFolderPicker] = useState(false);
+  const [showCreateFolderInline, setShowCreateFolderInline] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+
   const [reminderOn, setReminderOn] = useState(!!note?.reminderAt);
   const [reminderAt, setReminderAt] = useState(note?.reminderAt ?? null);
   const [reminderRepeat, setReminderRepeat] = useState(note?.reminderRepeat ?? "none");
 
-  // Android picker 2 bước
-  const [pickerMode, setPickerMode] = useState(null); // "date" | "time" | null
+  const [pickerMode, setPickerMode] = useState(null);
   const [tempDate, setTempDate] = useState(null);
 
-  // ====== Attachments ======
   const [images, setImages] = useState(() => {
     const remote = Array.isArray(note?.images) ? note.images : [];
     return remote.map((it) => ({
       url: it?.url ?? null,
       path: it?.path ?? null,
+      dataUrl: it?.dataUrl ?? null,
       localUri: null,
     }));
   });
@@ -94,22 +98,20 @@ export default function EditNoteScreen() {
     return remote.map((it) => ({
       url: it?.url ?? null,
       path: it?.path ?? null,
+      dataUrl: it?.dataUrl ?? null,
       localUri: null,
       durationMs: it?.durationMs ?? null,
     }));
   });
 
-  // ✅ Preview ảnh phóng to
   const [previewUri, setPreviewUri] = useState(null);
 
-  // Recording
   const recordingRef = useRef(null);
   const [isRecording, setIsRecording] = useState(false);
   const [recordingStatus, setRecordingStatus] = useState("");
   const [recordingMs, setRecordingMs] = useState(0);
   const timerRef = useRef(null);
 
-  // Playback
   const soundRef = useRef(null);
   const [playingIndex, setPlayingIndex] = useState(null);
 
@@ -124,7 +126,21 @@ export default function EditNoteScreen() {
     if (!user) router.replace("/login");
   }, [user, loading]);
 
-  // cleanup sound + interval
+  useEffect(() => {
+    if (loading || !user) return;
+
+    const unsub = listenFolders(user.uid, (data) => {
+      const names = data
+        .map((f) => f?.name?.trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+
+      setAllFolders(names);
+    });
+
+    return unsub;
+  }, [user, loading]);
+
   useEffect(() => {
     return () => {
       (async () => {
@@ -142,16 +158,16 @@ export default function EditNoteScreen() {
     };
   }, []);
 
-  // ✅ Refresh URL từ path để tránh URL cũ (.firebasestorage.app) bị 400
   useEffect(() => {
     let cancelled = false;
 
     const refreshUrls = async () => {
       const nextImages = await Promise.all(
         images.map(async (it) => {
-          if (it.localUri) return it;
+          if (it.localUri || it.dataUrl) return it;
 
           const badUrl = typeof it.url === "string" && it.url.includes(".firebasestorage.app");
+
           if ((!it.url || badUrl) && it.path) {
             try {
               const url = await getUrlFromPath(it.path);
@@ -166,9 +182,10 @@ export default function EditNoteScreen() {
 
       const nextAudios = await Promise.all(
         audios.map(async (it) => {
-          if (it.localUri) return it;
+          if (it.localUri || it.dataUrl) return it;
 
           const badUrl = typeof it.url === "string" && it.url.includes(".firebasestorage.app");
+
           if ((!it.url || badUrl) && it.path) {
             try {
               const url = await getUrlFromPath(it.path);
@@ -192,12 +209,53 @@ export default function EditNoteScreen() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const parseTags = () => {
-    const tags = tagsText.split(",").map((t) => t.trim()).filter(Boolean);
+    const tags = tagsText
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
     return Array.from(new Set(tags));
+  };
+
+  const getCurrentNoteData = () => {
+    const uniqueTags = parseTags();
+
+    return {
+      ...note,
+      title,
+      content,
+      folder: folder.trim(),
+      tags: uniqueTags,
+      color,
+      images,
+      audios,
+      reminderAt: reminderOn ? reminderAt : null,
+      reminderRepeat: reminderOn ? reminderRepeat : "none",
+      createdAt: note?.createdAt ?? Date.now(),
+      updatedAt: Date.now(),
+    };
+  };
+
+  const onExportPdf = async () => {
+    try {
+      const noteData = getCurrentNoteData();
+      await exportNoteToPdf(noteData);
+    } catch (e) {
+      console.log("export pdf error:", e);
+      Alert.alert("Lỗi", "Không thể xuất PDF.");
+    }
+  };
+
+  const onExportDocx = async () => {
+    try {
+      const noteData = getCurrentNoteData();
+      await exportNoteToDocx(noteData);
+    } catch (e) {
+      console.log("export docx error:", e);
+      Alert.alert("Lỗi", "Không thể xuất DOCX.");
+    }
   };
 
   const Chip = ({ active, label, onPress }) => (
@@ -212,13 +270,70 @@ export default function EditNoteScreen() {
         backgroundColor: active ? colors.primary : colors.muted,
       }}
     >
-      <Text style={{ color: active ? "white" : colors.text, fontWeight: "800", fontSize: 12 }}>
+      <Text
+        style={{
+          color: active ? "white" : colors.text,
+          fontWeight: "800",
+          fontSize: 12,
+        }}
+      >
         {label}
       </Text>
     </Pressable>
   );
 
-  // ====== Reminder picker ======
+  const FolderOption = ({ label, active, onPress }) => (
+    <Pressable
+      onPress={onPress}
+      style={{
+        paddingHorizontal: 12,
+        paddingVertical: 10,
+        borderRadius: radius.lg,
+        borderWidth: 1,
+        borderColor: active ? colors.primary : colors.border,
+        backgroundColor: active ? colors.primary : colors.card,
+      }}
+    >
+      <Text
+        style={{
+          color: active ? "white" : colors.text,
+          fontWeight: "800",
+        }}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+  const onCreateFolderInline = async () => {
+  if (!user) return;
+
+  const name = newFolderName.trim();
+  if (!name) {
+    return Alert.alert("Lỗi", "Tên folder không được để trống.");
+  }
+
+  const exists = allFolders.some((f) => f.toLowerCase() === name.toLowerCase());
+  if (exists) {
+    setFolder(name);
+    setNewFolderName("");
+    setShowCreateFolderInline(false);
+    setShowFolderPicker(false);
+    return Alert.alert("Thông báo", "Folder đã tồn tại, mình đã chọn folder này cho bạn.");
+  }
+
+  try {
+    await addFolder(user.uid, name);
+    setFolder(name);
+    setNewFolderName("");
+    setShowCreateFolderInline(false);
+    setShowFolderPicker(false);
+    Alert.alert("Thành công", `Đã tạo folder "${name}"`);
+  } catch (e) {
+    console.log("create inline folder error:", e);
+    Alert.alert("Lỗi", "Không thể tạo folder mới.");
+  }
+};
+
   const openDatePicker = () => {
     const base = reminderAt ?? Date.now() + 5 * 60 * 1000;
     setReminderAt(base);
@@ -226,7 +341,6 @@ export default function EditNoteScreen() {
     setPickerMode("date");
   };
 
-  // ====== Image picker ======
   const ensureImagePerm = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== "granted") {
@@ -251,35 +365,56 @@ export default function EditNoteScreen() {
 
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 0.85,
+      quality: 0.5,
       allowsMultipleSelection: true,
-      selectionLimit: 6,
+      selectionLimit: 3,
+      base64: true,
     });
 
     if (result.canceled) return;
 
     const assets = result.assets || [];
-    setImages((prev) => [...prev, ...assets.map((a) => ({ localUri: a.uri, url: null, path: null }))]);
+
+    setImages((prev) => [
+      ...prev,
+      ...assets.map((a) => ({
+        localUri: a.uri,
+        url: null,
+        path: null,
+        dataUrl: a.base64 ? `data:image/jpeg;base64,${a.base64}` : null,
+      })),
+    ]);
   };
 
   const takePhoto = async () => {
     const ok = await ensureCameraPerm();
     if (!ok) return;
 
-    const result = await ImagePicker.launchCameraAsync({ quality: 0.85 });
+    const result = await ImagePicker.launchCameraAsync({
+      quality: 0.5,
+      base64: true,
+    });
 
     if (result.canceled) return;
 
     const a = result.assets?.[0];
     if (!a?.uri) return;
-    setImages((prev) => [...prev, { localUri: a.uri, url: null, path: null }]);
+
+    setImages((prev) => [
+      ...prev,
+      {
+        localUri: a.uri,
+        url: null,
+        path: null,
+        dataUrl: a.base64 ? `data:image/jpeg;base64,${a.base64}` : null,
+      },
+    ]);
   };
 
   const removeImageAt = (idx) => {
     setImages((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  // ====== Audio recording/playback ======
   const startRecording = async () => {
     try {
       const perm = await Audio.requestPermissionsAsync();
@@ -348,7 +483,13 @@ export default function EditNoteScreen() {
       if (uri) {
         setAudios((prev) => [
           ...prev,
-          { localUri: uri, url: null, path: null, durationMs: durationMsLocal ?? null },
+          {
+            localUri: uri,
+            url: null,
+            path: null,
+            dataUrl: null,
+            durationMs: durationMsLocal ?? null,
+          },
         ]);
       }
     } catch (e) {
@@ -360,9 +501,49 @@ export default function EditNoteScreen() {
     }
   };
 
+  const ensureAudioFileFromDataUrl = async (dataUrl, idx) => {
+    if (!dataUrl || typeof dataUrl !== "string" || !dataUrl.startsWith("data:")) {
+      return null;
+    }
+
+    const parts = dataUrl.split(",");
+    if (parts.length < 2) return null;
+
+    const header = parts[0];
+    const base64 = parts[1];
+
+    let ext = "m4a";
+    if (header.includes("audio/mp4")) ext = "m4a";
+    else if (header.includes("audio/mpeg")) ext = "mp3";
+    else if (header.includes("audio/wav")) ext = "wav";
+
+    const fileUri = `${FileSystem.cacheDirectory}restored-audio-${idx}.${ext}`;
+
+    await FileSystem.writeAsStringAsync(fileUri, base64, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+
+    return fileUri;
+  };
+
   const playAudioAt = async (idx) => {
     const item = audios[idx];
-    const uri = item?.localUri || item?.url;
+    let uri = item?.localUri || item?.url;
+
+    if (!uri && item?.dataUrl) {
+      try {
+        uri = await ensureAudioFileFromDataUrl(item.dataUrl, idx);
+
+        if (uri) {
+          setAudios((prev) =>
+            prev.map((a, i) => (i === idx ? { ...a, localUri: uri } : a))
+          );
+        }
+      } catch (e) {
+        console.log("restore audio from dataUrl error:", e);
+      }
+    }
+
     if (!uri) return;
 
     try {
@@ -421,34 +602,61 @@ export default function EditNoteScreen() {
     setAudios((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  // ====== Upload attachments ======
-  const uploadPendingImages = async (uid) => {
+  const savePendingImages = async () => {
     const next = [];
+
     for (const it of images) {
-      if (it.url && it.path && !it.localUri) {
-        next.push({ url: it.url, path: it.path });
+      if (it.dataUrl) {
+        next.push({ dataUrl: it.dataUrl });
         continue;
       }
-      if (it.localUri) {
-        const uploaded = await uploadUriAsync({ uri: it.localUri, userId: uid, folder: "images" });
-        next.push({ url: uploaded.url, path: uploaded.path });
+
+      if (it.url || it.path) {
+        next.push({
+          url: it.url ?? null,
+          path: it.path ?? null,
+          dataUrl: it.dataUrl ?? null,
+        });
       }
     }
+
     return next;
   };
 
-  const uploadPendingAudios = async (uid) => {
+  const savePendingAudiosAsBase64 = async () => {
     const next = [];
+
     for (const it of audios) {
-      if (it.url && it.path && !it.localUri) {
-        next.push({ url: it.url, path: it.path, durationMs: it.durationMs ?? null });
+      if (it.dataUrl) {
+        next.push({
+          dataUrl: it.dataUrl,
+          durationMs: it.durationMs ?? null,
+        });
         continue;
       }
-      if (it.localUri) {
-        const uploaded = await uploadUriAsync({ uri: it.localUri, userId: uid, folder: "audios" });
-        next.push({ url: uploaded.url, path: uploaded.path, durationMs: it.durationMs ?? null });
+
+      if (it.localUri && typeof it.localUri === "string") {
+        const base64 = await FileSystem.readAsStringAsync(it.localUri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+
+        next.push({
+          dataUrl: `data:audio/mp4;base64,${base64}`,
+          durationMs: it.durationMs ?? null,
+        });
+        continue;
+      }
+
+      if (it.url || it.path) {
+        next.push({
+          url: it.url ?? null,
+          path: it.path ?? null,
+          dataUrl: it.dataUrl ?? null,
+          durationMs: it.durationMs ?? null,
+        });
       }
     }
+
     return next;
   };
 
@@ -469,13 +677,18 @@ export default function EditNoteScreen() {
     setIsSaving(true);
 
     try {
-      if (note?.reminderId && !reminderOn) await cancelReminder(note.reminderId);
+      if (note?.reminderId && !reminderOn) {
+        await cancelReminder(note.reminderId);
+      }
 
       let newReminderId = note?.reminderId ?? null;
       let nextReminderAt = reminderOn ? reminderAt : null;
 
       if (reminderOn) {
-        if (note?.reminderId) await cancelReminder(note.reminderId);
+        if (note?.reminderId) {
+          await cancelReminder(note.reminderId);
+        }
+
         const dateMs = nextReminderAt ?? Date.now() + 5 * 60 * 1000;
         nextReminderAt = dateMs;
 
@@ -487,17 +700,17 @@ export default function EditNoteScreen() {
         });
       }
 
-      const uploadedImages = await uploadPendingImages(user.uid);
-      const uploadedAudios = await uploadPendingAudios(user.uid);
+      const savedImages = await savePendingImages();
+      const savedAudios = await savePendingAudiosAsBase64();
 
       const data = {
-        title,
+        title: title.trim(),
         content,
         folder: folder.trim(),
         tags: uniqueTags,
         color,
-        images: uploadedImages,
-        audios: uploadedAudios,
+        images: savedImages,
+        audios: savedAudios,
         reminderAt: reminderOn ? nextReminderAt : null,
         reminderRepeat: reminderOn ? reminderRepeat : "none",
         reminderId: reminderOn ? newReminderId : null,
@@ -507,9 +720,14 @@ export default function EditNoteScreen() {
       if (note) {
         await updateNote(user.uid, note.id, data);
       } else {
-        await addNote(user.uid, { ...data, isPinned: false, createdAt: now });
+        await addNote(user.uid, {
+          ...data,
+          isPinned: false,
+          createdAt: now,
+        });
       }
 
+      Alert.alert("Thành công", "Đã lưu ghi chú.");
       router.back();
     } catch (e) {
       console.log("save error full:", e);
@@ -538,11 +756,16 @@ export default function EditNoteScreen() {
     >
       <ScrollView
         style={{ flex: 1 }}
-        contentContainerStyle={{ padding: space.md, gap: space.sm, paddingBottom: 120 }}
+        contentContainerStyle={{
+          padding: space.md,
+          gap: space.sm,
+          paddingBottom: 120,
+        }}
         keyboardShouldPersistTaps="handled"
       >
-        {/* Title */}
-        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>Tiêu đề</Text>
+        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
+          Tiêu đề
+        </Text>
         <TextInput
           value={title}
           onChangeText={setTitle}
@@ -557,12 +780,78 @@ export default function EditNoteScreen() {
           }}
         />
 
-        {/* Folder */}
-        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>Thư mục (Folder)</Text>
+        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
+          Thư mục (Folder)
+        </Text>
+
+        <Pressable
+          onPress={() => setShowFolderPicker((prev) => !prev)}
+          style={{
+            borderWidth: 1,
+            borderColor: colors.border,
+            borderRadius: radius.lg,
+            paddingHorizontal: 12,
+            paddingVertical: 12,
+            backgroundColor: colors.card,
+          }}
+        >
+          <Text style={{ color: folder ? colors.text : colors.subtext, fontWeight: "700" }}>
+            {folder || "Chọn hoặc tạo folder"}
+          </Text>
+        </Pressable>
+
+        {showFolderPicker && (
+  <View
+    style={{
+      gap: 10,
+      marginTop: 8,
+      padding: 12,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: radius.lg,
+      backgroundColor: colors.card,
+    }}
+  >
+    <FolderOption
+      label="Không chọn folder"
+      active={!folder}
+      onPress={() => {
+        setFolder("");
+        setShowFolderPicker(false);
+      }}
+    />
+
+    <Pressable
+      onPress={() => setShowCreateFolderInline((prev) => !prev)}
+      style={{
+        paddingHorizontal: 12,
+        paddingVertical: 10,
+        borderRadius: radius.lg,
+        borderWidth: 1,
+        borderColor: colors.border,
+        backgroundColor: colors.muted,
+      }}
+    >
+      <Text style={{ fontWeight: "800", color: colors.text }}>
+        + Tạo folder mới
+      </Text>
+    </Pressable>
+
+    {showCreateFolderInline && (
+      <View
+        style={{
+          gap: 8,
+          padding: 10,
+          borderWidth: 1,
+          borderColor: colors.border,
+          borderRadius: radius.lg,
+          backgroundColor: colors.bg,
+        }}
+      >
         <TextInput
-          value={folder}
-          onChangeText={setFolder}
-          placeholder='VD: "Công việc", "Học tập"...'
+          value={newFolderName}
+          onChangeText={setNewFolderName}
+          placeholder="Nhập tên folder mới..."
           style={{
             borderWidth: 1,
             borderColor: colors.border,
@@ -573,7 +862,63 @@ export default function EditNoteScreen() {
           }}
         />
 
-        {/* Tags */}
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          <Pressable
+            onPress={onCreateFolderInline}
+            style={{
+              flex: 1,
+              backgroundColor: colors.primary,
+              paddingVertical: 12,
+              borderRadius: radius.lg,
+              alignItems: "center",
+            }}
+          >
+            <Text style={{ color: "white", fontWeight: "900" }}>Tạo</Text>
+          </Pressable>
+
+          <Pressable
+            onPress={() => {
+              setShowCreateFolderInline(false);
+              setNewFolderName("");
+            }}
+            style={{
+              flex: 1,
+              borderWidth: 1,
+              borderColor: colors.border,
+              backgroundColor: colors.card,
+              paddingVertical: 12,
+              borderRadius: radius.lg,
+              alignItems: "center",
+            }}
+          >
+            <Text style={{ color: colors.text, fontWeight: "900" }}>Huỷ</Text>
+          </Pressable>
+        </View>
+      </View>
+    )}
+
+    {allFolders.length === 0 ? (
+      <Text style={{ color: colors.subtext }}>
+        Chưa có folder nào. Bạn có thể tạo ngay ở đây.
+      </Text>
+    ) : (
+      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+        {allFolders.map((f) => (
+          <FolderOption
+            key={f}
+            label={f}
+            active={folder === f}
+            onPress={() => {
+              setFolder(f);
+              setShowFolderPicker(false);
+            }}
+          />
+        ))}
+      </View>
+    )}
+  </View>
+)}
+
         <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
           Tags (phân cách bằng dấu phẩy)
         </Text>
@@ -591,17 +936,19 @@ export default function EditNoteScreen() {
           }}
         />
 
-        {/* Color */}
-        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>Màu ghi chú</Text>
+        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
+          Màu ghi chú
+        </Text>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           {["gray", "yellow", "blue", "green", "pink"].map((c) => (
             <Chip key={c} label={c} active={color === c} onPress={() => setColor(c)} />
           ))}
         </View>
 
-        {/* Images */}
         <View style={{ marginTop: 8, gap: 8 }}>
-          <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>Ảnh đính kèm</Text>
+          <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
+            Ảnh đính kèm
+          </Text>
 
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
             <Pressable
@@ -638,14 +985,19 @@ export default function EditNoteScreen() {
           ) : (
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 10 }}>
               {images.map((it, idx) => {
-                const uri = it.localUri || it.url;
+                const uri = it.localUri || it.url || it.dataUrl;
                 return (
                   <View key={`${uri || "img"}_${idx}`} style={{ width: 110, gap: 6 }}>
                     <Pressable onPress={() => uri && setPreviewUri(uri)}>
                       <Image
                         source={uri ? { uri } : undefined}
                         onError={(e) => console.log("Image load error:", uri, e?.nativeEvent)}
-                        style={{ width: 110, height: 110, borderRadius: 14, backgroundColor: colors.muted }}
+                        style={{
+                          width: 110,
+                          height: 110,
+                          borderRadius: 14,
+                          backgroundColor: colors.muted,
+                        }}
                       />
                     </Pressable>
 
@@ -659,9 +1011,10 @@ export default function EditNoteScreen() {
           )}
         </View>
 
-        {/* Audio */}
         <View style={{ marginTop: 8, gap: 8 }}>
-          <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>Ghi âm đính kèm</Text>
+          <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
+            Ghi âm đính kèm
+          </Text>
 
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
             {!isRecording ? (
@@ -709,7 +1062,7 @@ export default function EditNoteScreen() {
                 const isPlaying = playingIndex === idx;
                 return (
                   <View
-                    key={`${it.localUri || it.url || "audio"}_${idx}`}
+                    key={`${it.localUri || it.url || it.dataUrl || "audio"}_${idx}`}
                     style={{
                       borderWidth: 1,
                       borderColor: colors.border,
@@ -735,7 +1088,9 @@ export default function EditNoteScreen() {
                           backgroundColor: colors.muted,
                         }}
                       >
-                        <Text style={{ fontWeight: "900" }}>{isPlaying ? "⏸ Stop" : "▶ Play"}</Text>
+                        <Text style={{ fontWeight: "900" }}>
+                          {isPlaying ? "⏸ Stop" : "▶ Play"}
+                        </Text>
                       </Pressable>
 
                       <Pressable
@@ -759,9 +1114,10 @@ export default function EditNoteScreen() {
           )}
         </View>
 
-        {/* Reminder */}
         <View style={{ marginTop: 10, gap: 8 }}>
-          <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>Nhắc nhở (Reminder)</Text>
+          <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
+            Nhắc nhở (Reminder)
+          </Text>
 
           <View style={{ flexDirection: "row", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <Pressable
@@ -798,12 +1154,16 @@ export default function EditNoteScreen() {
                 opacity: reminderOn ? 1 : 0.6,
               }}
             >
-              <Text style={{ fontWeight: "900", color: colors.text }}>{formatDateTime(reminderAt)}</Text>
+              <Text style={{ fontWeight: "900", color: colors.text }}>
+                {formatDateTime(reminderAt)}
+              </Text>
             </Pressable>
           </View>
 
           <View style={{ gap: 8 }}>
-            <Text style={{ fontWeight: "900", color: colors.text }}>Lặp lại: {repeatLabel(reminderRepeat)}</Text>
+            <Text style={{ fontWeight: "900", color: colors.text }}>
+              Lặp lại: {repeatLabel(reminderRepeat)}
+            </Text>
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
               <Chip label="Không lặp" active={reminderRepeat === "none"} onPress={() => setReminderRepeat("none")} />
               <Chip label="Hàng ngày" active={reminderRepeat === "daily"} onPress={() => setReminderRepeat("daily")} />
@@ -851,8 +1211,9 @@ export default function EditNoteScreen() {
           )}
         </View>
 
-        {/* Content */}
-        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>Nội dung</Text>
+        <Text style={{ fontSize: typography.small, fontWeight: "900", color: colors.text }}>
+          Nội dung
+        </Text>
         <TextInput
           value={content}
           onChangeText={setContent}
@@ -869,7 +1230,38 @@ export default function EditNoteScreen() {
           }}
         />
 
-        {/* Save/Cancel */}
+        <View style={{ flexDirection: "row", gap: 10 }}>
+          <Pressable
+            onPress={onExportPdf}
+            style={{
+              flex: 1,
+              paddingVertical: 12,
+              borderRadius: radius.lg,
+              alignItems: "center",
+              borderWidth: 1,
+              borderColor: colors.border,
+              backgroundColor: colors.card,
+            }}
+          >
+            <Text style={{ fontWeight: "900", color: colors.text }}>Xuất PDF</Text>
+          </Pressable>
+
+          <Pressable
+            onPress={onExportDocx}
+            style={{
+              flex: 1,
+              paddingVertical: 12,
+              borderRadius: radius.lg,
+              alignItems: "center",
+              borderWidth: 1,
+              borderColor: colors.border,
+              backgroundColor: colors.card,
+            }}
+          >
+            <Text style={{ fontWeight: "900", color: colors.text }}>Xuất DOCX</Text>
+          </Pressable>
+        </View>
+
         <Pressable
           onPress={onSave}
           disabled={isSaving}
@@ -882,7 +1274,9 @@ export default function EditNoteScreen() {
             opacity: isSaving ? 0.7 : 1,
           }}
         >
-          <Text style={{ color: "white", fontWeight: "900" }}>{isSaving ? "Đang lưu..." : "Lưu"}</Text>
+          <Text style={{ color: "white", fontWeight: "900" }}>
+            {isSaving ? "Đang lưu..." : "Lưu"}
+          </Text>
         </Pressable>
 
         <Pressable
@@ -900,7 +1294,6 @@ export default function EditNoteScreen() {
         </Pressable>
       </ScrollView>
 
-      {/* ✅ Modal phóng to ảnh */}
       <Modal
         visible={!!previewUri}
         transparent
@@ -923,7 +1316,11 @@ export default function EditNoteScreen() {
 
           <View style={{ flex: 1, justifyContent: "center", alignItems: "center", padding: 12 }}>
             {!!previewUri && (
-              <Image source={{ uri: previewUri }} style={{ width: "100%", height: "100%" }} resizeMode="contain" />
+              <Image
+                source={{ uri: previewUri }}
+                style={{ width: "100%", height: "100%" }}
+                resizeMode="contain"
+              />
             )}
           </View>
         </View>
